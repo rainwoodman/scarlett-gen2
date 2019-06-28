@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- *   Focusrite Scarlett 18i8/18i20 Gen 2 Driver for ALSA
+ *   Focusrite Scarlett 6i6/18i8/18i20 Gen 2 Driver for ALSA
  *
  *   Copyright (c) 2018-2019 by Geoffrey D. Bennett <g at b4.vu>
  *
@@ -30,7 +30,7 @@
  *
  */
 
-/* Mixer Interface for the Focusrite Scarlett 18i8/18i20 Gen 2 audio
+/* Mixer Interface for the Focusrite Scarlett 6i6/18i8/18i20 Gen 2 audio
  * interface. Based on the Gen 1 driver and rewritten.
  */
 
@@ -39,6 +39,9 @@
  * (firmware 1083) using usbmon in July-August 2018.
  *
  * Scarlett 18i8 support added in April 2019.
+ *
+ * Scarlett 6i6 support added in June 2019 (thanks to Martin Wittmann
+ * for providing usbmon output and testing).
  *
  * This ALSA mixer gives access to:
  *  - input, output, mixer-matrix muxes
@@ -256,6 +259,60 @@ struct scarlett2_usb_volume_status {
 } __packed;
 
 /*** Model-specific data ***/
+
+static const struct scarlett2_device_info s6i6_gen2_info = {
+	/* The first two analogue inputs can be switched between line
+	 * and instrument levels.
+	 */
+	.level_input_count = 2,
+
+	/* The first two analogue inputs have an optional pad. */
+	.pad_input_count = 2,
+
+	.line_out_descrs = {
+		"Monitor L",
+		"Monitor R",
+		"Headphones L",
+		"Headphones R",
+	},
+
+	.ports = {
+		{
+			.id = 0x000,
+			.num = { 1, 0, 8, 8, 8 },
+			.src_descr = "Off",
+			.src_num_offset = 0,
+		},
+		{
+			.id = 0x080,
+			.num = { 4, 4, 4, 4, 4 },
+			.src_descr = "Analogue %d",
+			.src_num_offset = 1,
+			.dst_descr = "Analogue Output %02d Playback"
+		},
+		{
+			.id = 0x180,
+			.num = { 2, 2, 2, 2, 2 },
+			.src_descr = "S/PDIF %d",
+			.src_num_offset = 1,
+			.dst_descr = "S/PDIF Output %d Playback"
+		},
+		{
+			.id = 0x300,
+			.num = { 10, 18, 18, 18, 18 },
+			.src_descr = "Mix %c",
+			.src_num_offset = 65,
+			.dst_descr = "Mixer Input %02d Capture"
+		},
+		{
+			.id = 0x600,
+			.num = { 6, 6, 6, 6, 6 },
+			.src_descr = "PCM %d",
+			.src_num_offset = 1,
+			.dst_descr = "PCM %02d Capture"
+		},
+	},
+};
 
 static const struct scarlett2_device_info s18i8_gen2_info = {
 	/* The first two analogue inputs can be switched between line
@@ -1976,6 +2033,9 @@ int snd_scarlett_gen2_controls_create(struct usb_mixer_interface *mixer)
 		return 0;
 
 	switch (mixer->chip->usb_id) {
+	case USB_ID(0x1235, 0x8203):
+		info = &s6i6_gen2_info;
+		break;
 	case USB_ID(0x1235, 0x8204):
 		info = &s18i8_gen2_info;
 		break;
