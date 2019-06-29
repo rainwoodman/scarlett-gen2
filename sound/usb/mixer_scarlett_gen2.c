@@ -90,10 +90,10 @@
  *  | Hardware out |       |                         \--------------/
  *  \--------------/       |
  *                         v
- *                  +-------------+    switch per channel to select
- *                  | Master Gain |<-- front panel volume knob or
- *                  +------+------+    individual software gain
- *                         |           (18i20 only)
+ *                  +-------------+    Software gain per channel.
+ *                  | Master Gain |<-- 18i20 only: Switch per channel
+ *                  +------+------+    to select HW or SW gain control.
+ *                         |
  *                         |10chn
  *  /--------------\       |
  *  | Analogue     |<------/
@@ -242,21 +242,10 @@ struct scarlett2_mixer_data {
 	u8 buttons[SCARLETT2_BUTTON_MAX];
 	struct snd_kcontrol *master_vol_ctl;
 	struct snd_kcontrol *vol_ctls[SCARLETT2_ANALOGUE_MAX];
-	struct snd_kcontrol *button_ctls[SCARLETT2_ANALOGUE_MAX];
+	struct snd_kcontrol *button_ctls[SCARLETT2_BUTTON_MAX];
 	u8 mux[SCARLETT2_MUX_MAX];
 	u8 mix[SCARLETT2_INPUT_MIX_MAX * SCARLETT2_OUTPUT_MIX_MAX];
 };
-
-struct scarlett2_usb_volume_status {
-	u8 buttons[SCARLETT2_BUTTON_MAX]; /* mute & dim buttons */
-	u8 pad1;
-	s16 sw_vol[10]; /* software volume setting */
-	s16 hw_vol[10]; /* actual volume of output inc. dim (-18dB) */
-	u8 pad2[10];
-	u8 sw_hw_switch[10]; /* sw (0) or hw (1) controlled */
-	u8 pad3[6];
-	s16 master_vol; /* front panel volume knob */
-} __packed;
 
 /*** Model-specific data ***/
 
@@ -491,13 +480,38 @@ static int scarlett2_get_port_start_num(const struct scarlett2_ports *ports,
 #define SCARLETT2_USB_VOLUME_STATUS_OFFSET 0x31
 #define SCARLETT2_USB_METER_LEVELS_GET_MAGIC 1
 
+/* volume status is read together (matches scarlett2_config_items[]) */
+struct scarlett2_usb_volume_status {
+	/* mute & dim buttons */
+	u8 buttons[SCARLETT2_BUTTON_MAX];
+
+	u8 pad1;
+
+	/* software volume setting */
+	s16 sw_vol[SCARLETT2_ANALOGUE_MAX];
+
+	/* actual volume of output inc. dim (-18dB) */
+	s16 hw_vol[SCARLETT2_ANALOGUE_MAX];
+
+	u8 pad2[SCARLETT2_ANALOGUE_MAX];
+
+	/* sw (0) or hw (1) controlled */
+	u8 sw_hw_switch[SCARLETT2_ANALOGUE_MAX];
+
+	u8 pad3[6];
+
+	/* front panel volume knob */
+	s16 master_vol;
+} __packed;
+
 /* Configuration parameters that can be read and written */
 enum {
-	SCARLETT2_CONFIG_LINE_OUT_VOLUME = 0,
-	SCARLETT2_CONFIG_SW_HW_SWITCH = 1,
-	SCARLETT2_CONFIG_LEVEL_SWITCH = 2,
-	SCARLETT2_CONFIG_PAD_SWITCH = 3,
-	SCARLETT2_CONFIG_COUNT = 4
+	SCARLETT2_CONFIG_BUTTONS = 0,
+	SCARLETT2_CONFIG_LINE_OUT_VOLUME = 1,
+	SCARLETT2_CONFIG_SW_HW_SWITCH = 2,
+	SCARLETT2_CONFIG_LEVEL_SWITCH = 3,
+	SCARLETT2_CONFIG_PAD_SWITCH = 4,
+	SCARLETT2_CONFIG_COUNT = 5
 };
 
 /* Location, size, and activation command number for the configuration
@@ -511,6 +525,13 @@ struct scarlett2_config {
 
 static const struct scarlett2_config
 		scarlett2_config_items[SCARLETT2_CONFIG_COUNT] = {
+	/* Mute/Dim Buttons */
+	{
+		.offset = 0x31,
+		.size = 1,
+		.activate = 2
+	},
+
 	/* Line Out Volume */
 	{
 		.offset = 0x34,
@@ -1393,12 +1414,42 @@ static int scarlett2_button_ctl_get(struct snd_kcontrol *kctl,
 	return 0;
 }
 
+static int scarlett2_button_ctl_put(struct snd_kcontrol *kctl,
+				    struct snd_ctl_elem_value *ucontrol)
+{
+	struct usb_mixer_elem_info *elem = kctl->private_data;
+	struct usb_mixer_interface *mixer = elem->head.mixer;
+	struct scarlett2_mixer_data *private = mixer->private;
+
+	int index = elem->control;
+	int oval, val, err = 0;
+
+	mutex_lock(&private->data_mutex);
+	del_timer_sync(&mixer->timer);
+
+	oval = private->buttons[index];
+	val = !!ucontrol->value.integer.value[0];
+
+	if (oval == val)
+		goto unlock;
+
+	private->buttons[index] = val;
+
+	/* Send switch change to the device */
+	err = scarlett2_usb_set_config(mixer, SCARLETT2_CONFIG_BUTTONS,
+				       index, val);
+
+unlock:
+	mutex_unlock(&private->data_mutex);
+	return err;
+}
+
 static const struct snd_kcontrol_new scarlett2_button_ctl = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-	.access = SNDRV_CTL_ELEM_ACCESS_READ,
 	.name = "",
 	.info = snd_ctl_boolean_mono_info,
-	.get  = scarlett2_button_ctl_get
+	.get  = scarlett2_button_ctl_get,
+	.put  = scarlett2_button_ctl_put
 };
 
 /*** Create the analogue output controls ***/
