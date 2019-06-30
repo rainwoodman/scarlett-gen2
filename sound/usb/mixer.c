@@ -3518,9 +3518,8 @@ void snd_usb_mixer_disconnect(struct usb_mixer_interface *mixer)
 		usb_kill_urb(mixer->urb);
 	if (mixer->rc_urb)
 		usb_kill_urb(mixer->rc_urb);
-	kfree(mixer->scarlett2_buffer);
-	del_timer_sync(&mixer->timer);
-	kfree(mixer->private);
+	if (mixer->private_free)
+		mixer->private_free(mixer);
 	mixer->disconnected = true;
 }
 

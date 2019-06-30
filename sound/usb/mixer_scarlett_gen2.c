@@ -105,6 +105,7 @@
 
 #include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/moduleparam.h>
 
 #include <sound/control.h>
 #include <sound/tlv.h>
@@ -114,6 +115,11 @@
 #include "helper.h"
 
 #include "mixer_scarlett_gen2.h"
+
+static int scarlett_gen2_mixer_enable = 0;
+module_param(scarlett_gen2_mixer_enable, int, 0444);
+MODULE_PARM_DESC(scarlett_gen2_mixer_enable,
+		 "Focusrite Scarlett Gen 2 Mixer Driver Enable");
 
 /* some gui mixers can't handle negative ctl values */
 #define SCARLETT_VOLUME_BIAS 127
@@ -228,8 +234,10 @@ struct scarlett2_device_info {
 };
 
 struct scarlett2_mixer_data {
+	struct usb_mixer_interface *mixer;
 	struct mutex usb_mutex; /* prevent sending concurrent USB requests */
 	struct mutex data_mutex; /* lock access to this data */
+	struct delayed_work work;
 	const struct scarlett2_device_info *info;
 	int num_mux_srcs;
 	u16 scarlett2_seq;
@@ -246,6 +254,8 @@ struct scarlett2_mixer_data {
 	u8 mux[SCARLETT2_MUX_MAX];
 	u8 mix[SCARLETT2_INPUT_MIX_MAX * SCARLETT2_OUTPUT_MIX_MAX];
 };
+
+static void snd_scarlett_gen2_private_free(struct usb_mixer_interface *mixer);
 
 /*** Model-specific data ***/
 
@@ -592,7 +602,7 @@ static int scarlett2_usb(
 	struct usb_mixer_interface *mixer, u32 cmd,
 	void *req_data, u16 req_size, void *resp_data, u16 resp_size)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	u16 req_buf_size = sizeof(struct scarlett2_usb_packet) + req_size;
 	u16 resp_buf_size = sizeof(struct scarlett2_usb_packet) + resp_size;
@@ -691,106 +701,17 @@ unlock:
 	return err;
 }
 
-/* Clean up after SCARLETT2_USB_CONFIG_SAVE response is received */
-static void scarlett2_config_save_response_complete(struct urb *urb)
-{
-	struct usb_mixer_interface *mixer = urb->context;
-	struct scarlett2_usb_packet *resp = mixer->scarlett2_buffer;
-
-	if (urb->status < 0) {
-		usb_audio_err(mixer->chip, "%s: status %d\n",
-			      __func__, urb->status);
-	} else if (resp->error) {
-		usb_audio_err(mixer->chip, "%s: error %d\n",
-			      __func__, le16_to_cpu(resp->error));
-	}
-
-	usb_free_urb(mixer->rc_urb);
-	mixer->rc_urb = 0;
-	kfree(mixer->rc_setup_packet);
-	mixer->rc_setup_packet = 0;
-}
-
-/* Fill mixer->rc_setup_packet and mixer->urb then submit it */
-static void scarlett2_send_mixer_control_urb(
-	struct usb_mixer_interface *mixer, u8 dirn, u8 req,
-	int len, usb_complete_t complete_fn)
-{
-	struct usb_ctrlrequest *ctrl = mixer->rc_setup_packet;
-
-	ctrl->bRequestType = USB_RECIP_INTERFACE | USB_TYPE_CLASS | dirn;
-	ctrl->bRequest = req;
-	ctrl->wValue = cpu_to_le16(0);
-	ctrl->wIndex = cpu_to_le16(SCARLETT2_USB_VENDOR_SPECIFIC_INTERFACE);
-	ctrl->wLength = cpu_to_le16(len);
-
-	usb_fill_control_urb(mixer->rc_urb, mixer->chip->dev,
-			     usb_sndctrlpipe(mixer->chip->dev, 0),
-			     (u8 *)ctrl, mixer->scarlett2_buffer, len,
-			     complete_fn, mixer);
-
-	usb_submit_urb(mixer->rc_urb, GFP_ATOMIC);
-}
-
-/* SCARLETT2_USB_CONFIG_SAVE is complete; send a request for the response */
-static void scarlett2_config_save_complete(struct urb *urb)
-{
-	struct usb_mixer_interface *mixer = urb->context;
-	int len = SCARLETT2_USB_PACKET_LEN;
-
-	if (urb->status < 0) {
-		usb_audio_err(mixer->chip,
-			      "%s: status %d\n", __func__, urb->status);
-
-		usb_free_urb(mixer->rc_urb);
-		mixer->rc_urb = 0;
-		kfree(mixer->rc_setup_packet);
-		mixer->rc_setup_packet = 0;
-
-		return;
-	}
-
-	scarlett2_send_mixer_control_urb(
-		mixer, USB_DIR_IN, SCARLETT2_USB_VENDOR_SPECIFIC_CMD_RESP,
-		len, scarlett2_config_save_response_complete);
-}
-
 /* Send SCARLETT2_USB_DATA_CMD SCARLETT2_USB_CONFIG_SAVE */
-static void scarlett2_config_save(struct timer_list *t)
+static void scarlett2_config_save(struct work_struct *work)
 {
-	struct usb_mixer_interface *mixer = from_timer(mixer, t, timer);
-	struct scarlett2_usb_packet *req = mixer->scarlett2_buffer;
-	struct scarlett2_mixer_data *private = mixer->private;
-	int len = SCARLETT2_USB_PACKET_LEN + sizeof(u32);
+	struct scarlett2_mixer_data *private =
+		container_of(work, struct scarlett2_mixer_data, work.work);
+	struct usb_mixer_interface *mixer = private->mixer;
+	u32 req = cpu_to_le32(SCARLETT2_USB_CONFIG_SAVE);
 
-	if (mixer->rc_urb) {
-		usb_audio_err(mixer->chip,
-			      "%s: mixer rc_urb already in use!\n", __func__);
-		return;
-	}
-	mixer->rc_urb = usb_alloc_urb(0, GFP_ATOMIC);
-	if (!mixer->rc_urb) {
-		usb_audio_err(mixer->chip,
-			      "%s: usb_alloc_urb() failed!\n", __func__);
-		return;
-	}
-	mixer->rc_setup_packet =
-		kmalloc(sizeof(*mixer->rc_setup_packet), GFP_KERNEL);
-	if (!mixer->rc_setup_packet) {
-		usb_free_urb(mixer->rc_urb);
-		mixer->rc_urb = NULL;
-		usb_audio_err(mixer->chip,
-			      "%s: kmalloc() failed!\n", __func__);
-		return;
-	}
-
-	scarlett2_fill_request_header(private, mixer->scarlett2_buffer,
-				      SCARLETT2_USB_DATA_CMD, sizeof(u32));
-	*(u32 *)(req->data) = cpu_to_le32(SCARLETT2_USB_CONFIG_SAVE);
-
-	scarlett2_send_mixer_control_urb(
-		mixer, USB_DIR_OUT, SCARLETT2_USB_VENDOR_SPECIFIC_CMD_REQ,
-		len, scarlett2_config_save_complete);
+	scarlett2_usb(mixer, SCARLETT2_USB_DATA_CMD,
+		      &req, sizeof(u32),
+		      NULL, 0);
 }
 
 /* Send a USB message to set a configuration parameter (volume level,
@@ -809,6 +730,7 @@ static int scarlett2_usb_set_config(
 	} __packed req;
 	u32 req2;
 	int err;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	/* Send the configuration parameter data */
 	req.offset = cpu_to_le32(config_item.offset + index * config_item.size);
@@ -828,7 +750,7 @@ static int scarlett2_usb_set_config(
 		return err;
 
 	/* Schedule the change to be written to NVRAM */
-	mod_timer(&mixer->timer, jiffies + msecs_to_jiffies(2000));
+	schedule_delayed_work(&private->work, msecs_to_jiffies(2000));
 
 	return 0;
 }
@@ -876,7 +798,7 @@ static int scarlett2_usb_get_volume_status(
 static int scarlett2_usb_set_mix(struct usb_mixer_interface *mixer,
 				     int mix_num)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 
 	struct {
@@ -921,7 +843,7 @@ static u32 scarlett2_mux_src_num_to_id(const struct scarlett2_ports *ports,
 /* Send USB messages to set mux inputs */
 static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	const struct scarlett2_ports *ports = info->ports;
 	int rate, port_dir_rate;
@@ -1066,7 +988,7 @@ static int scarlett2_add_new_ctl(struct usb_mixer_interface *mixer,
  */
 static int scarlett2_update_volumes(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_ports *ports = private->info->ports;
 	struct scarlett2_usb_volume_status volume_status;
 	int num_line_out =
@@ -1112,7 +1034,7 @@ static int scarlett2_master_volume_ctl_get(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	if (private->vol_updated) {
 		mutex_lock(&private->data_mutex);
@@ -1129,7 +1051,7 @@ static int scarlett2_volume_ctl_get(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	int index = elem->control;
 
 	if (private->vol_updated) {
@@ -1147,12 +1069,12 @@ static int scarlett2_volume_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	int index = elem->control;
 	int oval, val, err = 0;
 
+	cancel_delayed_work_sync(&private->work);
 	mutex_lock(&private->data_mutex);
-	del_timer_sync(&mixer->timer);
 
 	oval = private->vol[index];
 	val = ucontrol->value.integer.value[0];
@@ -1214,7 +1136,7 @@ static int scarlett2_sw_hw_enum_ctl_get(struct snd_kcontrol *kctl,
 					struct snd_ctl_elem_value *ucontrol)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 
 	ucontrol->value.enumerated.item[0] =
 		private->vol_sw_hw_switch[elem->control];
@@ -1226,13 +1148,13 @@ static int scarlett2_sw_hw_enum_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	int index = elem->control;
 	int oval, val, err = 0;
 
+	cancel_delayed_work_sync(&private->work);
 	mutex_lock(&private->data_mutex);
-	del_timer_sync(&mixer->timer);
 
 	oval = private->vol_sw_hw_switch[index];
 	val = !!ucontrol->value.integer.value[0];
@@ -1299,7 +1221,7 @@ static int scarlett2_level_enum_ctl_get(struct snd_kcontrol *kctl,
 					struct snd_ctl_elem_value *ucontrol)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 
 	ucontrol->value.enumerated.item[0] =
 		private->level_switch[elem->control];
@@ -1311,13 +1233,13 @@ static int scarlett2_level_enum_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	int index = elem->control;
 	int oval, val, err = 0;
 
+	cancel_delayed_work_sync(&private->work);
 	mutex_lock(&private->data_mutex);
-	del_timer_sync(&mixer->timer);
 
 	oval = private->level_switch[index];
 	val = !!ucontrol->value.integer.value[0];
@@ -1350,7 +1272,7 @@ static int scarlett2_pad_ctl_get(struct snd_kcontrol *kctl,
 				 struct snd_ctl_elem_value *ucontrol)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 
 	ucontrol->value.enumerated.item[0] =
 		private->pad_switch[elem->control];
@@ -1362,13 +1284,13 @@ static int scarlett2_pad_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	int index = elem->control;
 	int oval, val, err = 0;
 
+	cancel_delayed_work_sync(&private->work);
 	mutex_lock(&private->data_mutex);
-	del_timer_sync(&mixer->timer);
 
 	oval = private->pad_switch[index];
 	val = !!ucontrol->value.integer.value[0];
@@ -1402,7 +1324,7 @@ static int scarlett2_button_ctl_get(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	if (private->vol_updated) {
 		mutex_lock(&private->data_mutex);
@@ -1419,13 +1341,13 @@ static int scarlett2_button_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 
 	int index = elem->control;
 	int oval, val, err = 0;
 
+	cancel_delayed_work_sync(&private->work);
 	mutex_lock(&private->data_mutex);
-	del_timer_sync(&mixer->timer);
 
 	oval = private->buttons[index];
 	val = !!ucontrol->value.integer.value[0];
@@ -1456,7 +1378,7 @@ static const struct snd_kcontrol_new scarlett2_button_ctl = {
 
 static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	const struct scarlett2_ports *ports = info->ports;
 	int num_line_out =
@@ -1526,7 +1448,7 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 
 static int scarlett2_add_line_in_ctls(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	int err, i;
 	char s[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
@@ -1571,7 +1493,7 @@ static int scarlett2_mixer_ctl_get(struct snd_kcontrol *kctl,
 				   struct snd_ctl_elem_value *ucontrol)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 
 	ucontrol->value.integer.value[0] = private->mix[elem->control];
 	return 0;
@@ -1582,7 +1504,7 @@ static int scarlett2_mixer_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	const struct scarlett2_ports *ports = info->ports;
 	int oval, val, num_mixer_in, mix_num, err = 0;
@@ -1627,7 +1549,7 @@ static const struct snd_kcontrol_new scarlett2_mixer_ctl = {
 
 static int scarlett2_add_mixer_ctls(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_ports *ports = private->info->ports;
 	int err, i, j;
 	int index;
@@ -1657,7 +1579,7 @@ static int scarlett2_mux_src_enum_ctl_info(struct snd_kcontrol *kctl,
 					   struct snd_ctl_elem_info *uinfo)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 	const struct scarlett2_ports *ports = private->info->ports;
 	unsigned int item = uinfo->value.enumerated.item;
 	int items = private->num_mux_srcs;
@@ -1689,7 +1611,7 @@ static int scarlett2_mux_src_enum_ctl_get(struct snd_kcontrol *kctl,
 					  struct snd_ctl_elem_value *ucontrol)
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
-	struct scarlett2_mixer_data *private = elem->head.mixer->private;
+	struct scarlett2_mixer_data *private = elem->head.mixer->private_data;
 
 	ucontrol->value.enumerated.item[0] = private->mux[elem->control];
 	return 0;
@@ -1700,7 +1622,7 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 {
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	int index = elem->control;
 	int oval, val, err = 0;
 
@@ -1733,7 +1655,7 @@ static const struct snd_kcontrol_new scarlett2_mux_src_enum_ctl = {
 
 static int scarlett2_add_mux_enums(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_ports *ports = private->info->ports;
 	int port_type, channel, i;
 
@@ -1887,17 +1809,13 @@ static int scarlett2_init_private(struct usb_mixer_interface *mixer,
 
 	mutex_init(&private->usb_mutex);
 	mutex_init(&private->data_mutex);
-	timer_setup(&mixer->timer, scarlett2_config_save, 0);
+	INIT_DELAYED_WORK(&private->work, scarlett2_config_save);
 	private->info = info;
 	private->num_mux_srcs = scarlett2_count_mux_srcs(info->ports);
 	private->scarlett2_seq = 0;
-	mixer->private = private;
-
-	/* enough for the SCARLETT2_USB_DATA_CMD request sent by the timer
-	 * callback
-	 */
-	mixer->scarlett2_buffer = kmalloc(
-		SCARLETT2_USB_PACKET_LEN + sizeof(u32), GFP_KERNEL);
+	private->mixer = mixer;
+	mixer->private_data = private;
+	mixer->private_free = snd_scarlett_gen2_private_free;
 
 	/* Setup default routing */
 	scarlett2_init_routing(private->mux, info->ports);
@@ -1910,7 +1828,7 @@ static int scarlett2_init_private(struct usb_mixer_interface *mixer,
 /* Read line-in config and line-out volume settings on start */
 static int scarlett2_read_configs(struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	const struct scarlett2_ports *ports = info->ports;
 	int num_line_out =
@@ -1977,7 +1895,7 @@ static int scarlett2_read_configs(struct usb_mixer_interface *mixer)
 static void scarlett2_mixer_interrupt_vol_change(
 	struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	const struct scarlett2_ports *ports = private->info->ports;
 	int num_line_out =
 		ports[SCARLETT2_PORT_TYPE_ANALOGUE].num[SCARLETT2_PORT_OUT];
@@ -2000,7 +1918,7 @@ static void scarlett2_mixer_interrupt_vol_change(
 static void scarlett2_mixer_interrupt_button_change(
 	struct usb_mixer_interface *mixer)
 {
-	struct scarlett2_mixer_data *private = mixer->private;
+	struct scarlett2_mixer_data *private = mixer->private_data;
 	int i;
 
 	private->vol_updated = 1;
@@ -2097,6 +2015,14 @@ int snd_scarlett_gen2_controls_create(struct usb_mixer_interface *mixer)
 		return -EINVAL;
 	}
 
+	if (!scarlett_gen2_mixer_enable) {
+		usb_audio_err(mixer->chip,
+			"Focusrite Scarlett Gen 2 Mixer Driver disabled; use "
+			"options snd_usb_audio scarlett_gen2_mixer_enable=1 "
+			"to enable and report any issues to g@b4.vu");
+		return 0;
+	}
+
 	/* Initialise private data, routing, sequence number */
 	err = scarlett2_init_private(mixer, info);
 	if (err < 0)
@@ -2140,4 +2066,13 @@ int snd_scarlett_gen2_controls_create(struct usb_mixer_interface *mixer)
 	}
 
 	return 0;
+}
+
+static void snd_scarlett_gen2_private_free(struct usb_mixer_interface *mixer)
+{
+	struct scarlett2_mixer_data *private = mixer->private_data;
+
+	cancel_delayed_work_sync(&private->work);
+	kfree(private);
+	mixer->private_data = NULL;
 }

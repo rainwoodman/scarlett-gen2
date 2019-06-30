@@ -26,10 +26,8 @@ struct usb_mixer_interface {
 
 	bool disconnected;
 
-	/* Scarlett Gen 2 */
-	void *scarlett2_buffer;
-	struct timer_list timer;
-	void *private;
+	void *private_data;
+	void (*private_free)(struct usb_mixer_interface *private_data);
 };
 
 #define MAX_CHANNELS	16	/* max logical channels */
