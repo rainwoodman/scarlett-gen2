@@ -1,0 +1,6 @@
+git checkout scarlett-gen3
+git checkout -B scarlett-f32
+> git log to find a sane ancestor sha xxxxxx
+git rebase --onto f32  xxxxxx
+> resolve conflict (Makefile usually)
+git push -f origin
