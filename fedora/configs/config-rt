@@ -1,0 +1,73 @@
+###
+# Planet CCRMA low latency kernel options
+###
+
+CONFIG_IRQ_FORCED_THREADING=y
+
+# do not add debugging options
+# CONFIG_DEBUG_PREEMPT is not set
+# CONFIG_PREEMPT_TRACER is not set
+
+# enable full rt preemption
+CONFIG_EXPERT=y
+CONFIG_PREEMPT_RT=y
+
+# "Testing module to detect hardware induced latencies"
+CONFIG_HWLAT_DETECTOR=m
+
+# enable histograms for now
+
+# "Interrupts-off Latency Histogram"
+CONFIG_INTERRUPT_OFF_HIST=y
+
+# "Preemption-off Latency Histogram"
+CONFIG_PREEMPT_OFF_HIST=y
+
+# "Scheduling Latency Histogram"
+CONFIG_WAKEUP_LATENCY_HIST=y
+
+# "Missed Timer Offsets Histogram"
+CONFIG_MISSED_TIMER_OFFSETS_HIST=y
+
+# taken from old rt configurations for 2.6.33
+CONFIG_RCU_BOOST=y
+# we also need these (just taking the defaults for now):
+CONFIG_RCU_BOOST_PRIO=1
+CONFIG_RCU_BOOST_DELAY=500
+
+CONFIG_X86_PAE=y
+
+# CONFIG_DEBUG_SLAB is not set
+# CONFIG_RCU_CPU_STALL_VERBOSE is not set
+
+### new options
+
+# from the old 2.6.33 configuration
+CONFIG_XEN_DEV_EVTCHN=m
+CONFIG_XEN_SYS_HYPERVISOR=y
+
+# allow sysrq output to affect latency, we are testing anyway
+CONFIG_MAGIC_SYSRQ_FORCE_PRINTK=y
+
+# required in 3.4.15 (only for ARM so ignored in our builds but needed for noarch)
+# CONFIG_ARM_ERRATA_775420 is not set
+
+# disable uprobes which is not compatible with the rt patch
+# (before 3.8 this was done by disabling the uprobes patch)
+# CONFIG_UPROBE_EVENT is not set
+# CONFIG_UPROBE is not set
+
+### temporary options
+
+# fix for 3.8.10-rt3 not compiling, details in the rt kernel list
+# this should be fixed one or the other in the near future...
+#
+# CONFIG_BCACHE is not set
+
+### up number of cpus, for some reason it is picking 8 (nando 2014.09.28)
+#   from here?: config-arm-generic:CONFIG_NR_CPUS=8
+#
+CONFIG_NR_CPUS=32
+
+### disable to allow compilation of the nvidia driver
+# CONFIG_DEBUG_LOCK_ALLOC is not set
